@@ -224,3 +224,84 @@ first version of this change deleted the former by accident and no render could 
 2. `gVoxelElementSize{X,Y,Z}` is passed to the kernel and never used. The field parameters
    deliberately do **not** imitate it: a field needs no voxel size in the kernel, because
    `alpha` is a world-unit ray and the box test is in IJK.
+
+---
+
+## 3. `Projector.initialize`: the volume crossed PCIe three times to be transposed once
+
+**Landed** 2026-08-11, phase P3 of mosaic's C5. **File:** `deepdrr/projector/projector.py`.
+
+Pure performance. **No rendered pixel changes** — the bytes reaching the texture are the same
+bytes in the same order.
+
+### The change
+
+`initialize` builds each volume's CUDA texture from a transposed copy. It already did the
+transpose on the GPU, then threw the result away:
+
+```python
+volume_gpu = cp.asarray(volume)                                   # host -> device
+volume_gpu = cp.moveaxis(volume_gpu, [0, 1, 2], [2, 1, 0])        # a strided VIEW
+volume = cp.asnumpy(volume_gpu)                                   # device -> host   <-- 1
+...
+vol_texobj, vol_texarr = create_cuda_texture(volume)              # host -> device   <-- 2
+```
+
+Lines 1 and 2 are a round trip through pageable host memory for data that was already on the
+device. `create_cuda_texture` ends in `CUDAarray.copy_from`, which takes a cupy array as
+happily as a numpy one, so the fix is to hand it the device array:
+
+```python
+volume_gpu = cp.ascontiguousarray(cp.moveaxis(cp.asarray(volume), [0, 1, 2], [2, 1, 0]))
+vol_texobj, vol_texarr = create_cuda_texture(volume_gpu)
+```
+
+`cp.moveaxis` returns a **strided view** and `copy_from` needs a contiguous block, so the
+contiguous copy is explicit. The same change is made to the segmentation texture below it.
+
+### The measurement
+
+NVIDIA L4, mosaic's PAT_23 case cropped to its illuminated box: a 1068 MB float32 volume and
+a 534 MB uint16 segmentation. Best of three, texture creation only:
+
+| | before | after |
+|---|---|---|
+| volume texture | 2.94 s | **0.34 s** |
+| segmentation texture | 0.92 s | **0.27 s** |
+
+End to end through mosaic's `qa/render_cost_report.py`, which times
+`Projector.initialize` directly:
+
+| scene | before | after |
+|---|---|---|
+| volume + 126 additive meshes | 4.74 s | **2.41 s** |
+| volume only | 4.22 s | **1.89 s** |
+
+Per-frame `project()` is unchanged (0.128 s with meshes, 0.085 s without, both sides).
+
+**Bit-identity:** mosaic's `qa/density_field_report.py --only 1` renders the PAT_23 scene and
+compares it against a stored reference captured before any of these fork changes:
+**0 of 262 144 pixels move, max |diff| 0.000e+00**, sha256 `0bbdb880…` either side. The mesh
+path is likewise unmoved — `qa/bolus_transport_report.py --sweep` reproduces its whole tiling
+table and `project_seg` at 100.0000%.
+
+### Why the memory guard changed from 1x to 3x
+
+The device path now holds the source, the transposed contiguous copy and the CUDAarray at the
+same moment, so it needs ~3x the volume in device memory and the headroom test says so. The
+old test asked for 1x, which did not cover the old path's own peak either (source + CUDAarray
+= 2x). Below the threshold both fall back to the host path, unchanged.
+
+### Who this helps
+
+Anything that builds more than one `Projector`. Mesh *geometry* is baked at
+`Projector.__init__`, so a dataset that varies the tool pose pays one `initialize` per pose;
+before this change ~3.2 s of each was moving data it already had. It is worth nothing to a
+single-render script and roughly 2x to a dataset export.
+
+### The mosaic-side reproducer
+
+```bash
+python -m sim.fluoro_sim.qa.render_cost_report --frames 20 --skip-per-call   # the upload
+python -m sim.fluoro_sim.qa.density_field_report --only 1                    # bit-identity
+```

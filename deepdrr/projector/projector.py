@@ -1643,20 +1643,38 @@ class Projector(object):
         # log.debug(f"Available Memory on CUDA device: {available_memory / (1024**2):.2f} MB")
 
         # if enough memory is available on the GPU we use CuPy for Volume data transformations to speed up projector initialization process
+        #
+        # The transposed volume goes STRAIGHT from the device into the CUDAarray. It used to
+        # be copied back to the host with `cp.asnumpy` first and then uploaded again, so a
+        # 1 GB volume crossed PCIe three times to be transposed once -- and both of those
+        # extra crossings were pageable (unpinned) host transfers, which are the slow kind.
+        # Measured on an L4, PAT_23's 1068 MB cropped volume: **2.94 s -> 0.34 s**, and the
+        # 534 MB segmentation below **0.92 s -> 0.27 s**. That is ~3.2 s off every
+        # `Projector.initialize`, which is the dominant cost of any pipeline that builds one
+        # Projector per tool pose. The bytes reaching the texture are identical, so every
+        # rendered frame is bit-identical -- see MOSAIC_FORK_CHANGES.md item 3.
+        #
+        # `cp.moveaxis` returns a strided VIEW and `CUDAarray.copy_from` needs a contiguous
+        # block, so the contiguous copy is explicit rather than hidden. That is why the
+        # headroom test below asks for 3x the volume: the source, the transposed copy, and
+        # the CUDAarray coexist for a moment. The old test asked for 1x, which did not cover
+        # the old path's own peak either.
         self.volumes_texobs = []
         self.volumes_texarrs = []
-        if available_memory > data_size_volume:
+        if available_memory > 3 * data_size_volume:
             for vol_id, volume in enumerate(self.volumes):
                 volume_gpu = cp.asarray(volume)  # Move volume to GPU
-                volume_gpu = cp.moveaxis(volume_gpu, [0, 1, 2], [2, 1, 0])  # Adjust axes on GPU
-                volume = cp.asnumpy(volume_gpu)  # Move volume back to CPU for texture creation
+                volume_gpu = cp.ascontiguousarray(
+                    cp.moveaxis(volume_gpu, [0, 1, 2], [2, 1, 0])  # Adjust axes on GPU
+                )
+
+                vol_texobj, vol_texarr = create_cuda_texture(volume_gpu)
 
                 # Free GPU memory
-                volume_gpu = None  
+                volume_gpu = None
                 cp.get_default_memory_pool().free_all_blocks()
                 cp.get_default_pinned_memory_pool().free_all_blocks()
-                
-                vol_texobj, vol_texarr = create_cuda_texture(volume)
+
                 self.volumes_texarrs.append(vol_texarr)
                 self.volumes_texobs.append(vol_texobj)
         else:
@@ -1676,7 +1694,8 @@ class Projector(object):
         # if enough memory is available on the GPU we use CuPy for Segmentation data transformations to speed up projector initialization process
         self.seg_texobs = []
         self.seg_texarrs = []
-        if available_memory > data_size_materials:
+        # Same change as the volume above, and for the same reason: 0.92 s -> 0.27 s.
+        if available_memory > 3 * data_size_materials:
             for vol_id, _vol in enumerate(self.volumes):
                 # Remap segmentation indices using cupy
                 label_list = []
@@ -1688,17 +1707,19 @@ class Projector(object):
                 # Perform remapping and axis adjustment on GPU
                 segmentation_gpu = cp.asarray(_vol.materials[1])
                 segmentation_gpu = label_dict_index_remapping[segmentation_gpu]
-                segmentation_gpu = cp.moveaxis(segmentation_gpu.astype(cp.uint8), [0, 1, 2], [2, 1, 0])
-                segmentation = cp.asnumpy(segmentation_gpu)  # Move segmentation to CPU for texture creation
+                segmentation_gpu = cp.ascontiguousarray(
+                    cp.moveaxis(segmentation_gpu.astype(cp.uint8), [0, 1, 2], [2, 1, 0])
+                )
+
+                combined_texobj, combined_texarr = create_cuda_texture(
+                    segmentation_gpu, sampling_mode="nearest", dtype=np.uint8
+                )
 
                 # Free GPU memory
-                segmentation_gpu = None 
+                segmentation_gpu = None
                 cp.get_default_memory_pool().free_all_blocks()
                 cp.get_default_pinned_memory_pool().free_all_blocks()
 
-                combined_texobj, combined_texarr = create_cuda_texture(
-                    segmentation, sampling_mode="nearest", dtype=np.uint8
-                )
                 self.seg_texobs.append(combined_texobj)
                 self.seg_texarrs.append(combined_texarr)
         else:
