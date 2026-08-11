@@ -329,6 +329,7 @@ def _get_kernel_projector_module(
     mesh_layers: int,
     air_index: int,
     attenuate_outside_volume: bool = False,
+    ijk_sample_offset: Optional[float] = None,
 ) -> cp.RawModule:
     """Compile the cuda code for the kernel projector.
 
@@ -338,6 +339,12 @@ def _get_kernel_projector_module(
     Args:
         num_volumes (int): The number of volumes to assume
         num_materials (int): The number of materials to assume
+        ijk_sample_offset (float, optional): Diagnostic override for the kernel's
+            `IJK_SAMPLE_OFFSET`. `None` (the default, and the only value the library itself
+            ever uses) leaves the kernel's own correct value of 0. Any other value renders a
+            deliberately misaligned volume and exists so
+            `sim/fluoro_sim/qa/kernel_grid_alignment_report.py` can measure the misalignment
+            as a function of the offset. See the macro's comment in `project_kernel.cu`.
 
     Returns:
         RawModule: The compiled cuda module
@@ -384,6 +391,10 @@ def _get_kernel_projector_module(
         "-I",
         str(d),
     ]
+
+    if ijk_sample_offset is not None:
+        options += ["-D", f"IJK_SAMPLE_OFFSET=({float(ijk_sample_offset)}f)"]
+
     log.debug(
         f"compiling {source_path} with NUM_VOLUMES={num_volumes}, NUM_MATERIALS={num_materials}"
     )
@@ -419,6 +430,7 @@ class Projector(object):
         max_mesh_hits=32,
         mesh_layers=2,
         cuda_device_id=None,
+        ijk_sample_offset: Optional[float] = None,
     ) -> None:
         """Create the projector, which has info for simulating the DRR.
 
@@ -451,11 +463,18 @@ class Projector(object):
             intensity_upper_bound (float, optional): Maximum intensity, clipped before neglog, after noise and scatter. A good value is 40 keV / photon. Defaults to None.
             source_to_detector_distance (float, optional): If `device` is not provided, this is the distance from the source to the detector. This limits the lenght rays are traced for. Defaults to -1 (no limit).
             carm (MobileCArm, optional): Deprecated alias for `device`. See `device`.
+            ijk_sample_offset (float, optional): **Diagnostic only.** Overrides the kernel's
+                `IJK_SAMPLE_OFFSET`, whose only correct value is 0 and which is what `None`
+                (the default) uses. Set it only to render a deliberately misaligned volume;
+                `sim/fluoro_sim/qa/kernel_grid_alignment_report.py` sweeps it to measure that
+                0 is the value that aligns volume content with mesh content.
         """
 
         self._egl_platform = None
 
         self.cuda_device_id = cuda_device_id
+
+        self.ijk_sample_offset = ijk_sample_offset
 
         self.mesh_layers = mesh_layers
 
@@ -1437,6 +1456,7 @@ class Projector(object):
             self.mesh_layers,
             air_index=self.air_index,
             attenuate_outside_volume=self.attenuate_outside_volume,
+            ijk_sample_offset=self.ijk_sample_offset,
         )
         self.project_kernel = self.mod.get_function("projectKernel")
 

@@ -6,6 +6,25 @@
 #define AIR_DENSITY 0.1129
 #endif
 
+// Offset added to the IJK ray coordinate before the per-step texture fetches.
+//
+// **The only correct value is 0.** Voxel n is centred at IJK n -- that is what the volume's
+// own declared bounds say (gVolumeEdgeMinPoint = -0.5, gVolumeEdgeMaxPoint = shape - 0.5) and
+// what Volume.ijk_from_world produces. The two fetches below then need different corrections,
+// and each already applies its own:
+//
+//   * the DENSITY fetch is linear-filtered, so it needs the texel-centre +0.5f -- and adds it
+//     itself (`px[vol_id] + 0.5f`);
+//   * the LABEL fetch is point-sampled, so tex3D<int> returns element floor(coord) and needs
+//     no correction at all -- it reads floor(q) and floor(q)+1 directly.
+//
+// This macro exists only so qa/kernel_grid_alignment_report.py can sweep it and *measure*
+// that 0 is correct, instead of asserting it in a comment. Nothing in the library sets it.
+// See MOSAIC_FORK_CHANGES.md item 1 for the measurement and the upstream history.
+#ifndef IJK_SAMPLE_OFFSET
+#define IJK_SAMPLE_OFFSET (0.0f)
+#endif
+
 // #define NUM_VOLUMES 1 // default for syntax highlighting
 // #define MESH_ADDITIVE_AND_SUBTRACTIVE_ENABLED 1 // default for syntax highlighting
 // #define MESH_ADDITIVE_ENABLED 1 // default for syntax highlighting
@@ -397,11 +416,11 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
     // trace (if doing the last segment separately, need to use num_steps - 1
     for (int t = 0; t < num_steps; t++) {
         for (int vol_id = 0; vol_id < NUM_VOLUMES; vol_id++) {
-            // we offset by -1.0f because we manually calculate the the trilinear filtering value in the surrounding area
-            // -0.5 offset for cuda texture and additional -0.5 offset to recenter for a standard grid
-            px[vol_id] = sx_ijk_local[vol_id] + alpha * rx_ijk[vol_id] - 1.0f;
-            py[vol_id] = sy_ijk_local[vol_id] + alpha * ry_ijk[vol_id] - 1.0f;
-            pz[vol_id] = sz_ijk_local[vol_id] + alpha * rz_ijk[vol_id] - 1.0f;
+            // Plain IJK, no correction: IJK_SAMPLE_OFFSET is 0. Each fetch below applies the
+            // correction its own filter mode needs -- see the macro's definition at the top.
+            px[vol_id] = sx_ijk_local[vol_id] + alpha * rx_ijk[vol_id] + IJK_SAMPLE_OFFSET;
+            py[vol_id] = sy_ijk_local[vol_id] + alpha * ry_ijk[vol_id] + IJK_SAMPLE_OFFSET;
+            pz[vol_id] = sz_ijk_local[vol_id] + alpha * rz_ijk[vol_id] + IJK_SAMPLE_OFFSET;
 
             // Reset segmentation values
             for (int mat_id = 0; mat_id < NUM_MATERIALS; mat_id++) {
