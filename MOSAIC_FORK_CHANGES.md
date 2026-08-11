@@ -116,3 +116,111 @@ Every rendered frame changes: bone and soft tissue move ~1.5 mm relative to tool
 existing check is either mesh-against-mesh (`project_seg` is mesh-only and never touches this
 kernel) or uses a **uniform** volume, in which a shift changes nothing. Mosaic's P0 checkpoint
 re-baselines all of them.
+
+---
+
+## 2. A continuous per-voxel additive material-density channel
+
+**Landed** 2026-08-11, phase P2 of mosaic's C5. **Files:** `deepdrr/vol/additive_density_field.py`
+(new), `deepdrr/vol/__init__.py`, `deepdrr/projector/project_kernel.cu`,
+`deepdrr/projector/projector.py`.
+
+**Inert as shipped.** Nothing in this library and nothing in mosaic's render path constructs
+one. `NUM_DENSITY_FIELDS` defaults to 0, and at 0 the kernel is item 1's kernel — measured
+below, not assumed. The mosaic caller is phase P3.
+
+### The change
+
+`AdditiveDensityField` — one resident float32 `CUDAarray` of `g/cm³` of **one named
+material**, linear-filtered, with its own `shape`, `spacing` and a **full**
+`world_from_ijk`; sampled once per ray step inside the field's own box and **added** to that
+material's `area_density[]`. Passed as `Projector(..., density_fields=[field])` and updated
+on a live `Projector` with `update_contrast(rho)` — one `cudaMemcpy3D`, no re-initialization.
+
+Three lines in the kernel do the work:
+
+```c
+float boundary = (0 == t || num_steps - 1 == t) ? 0.5f : 1.0f;   // hoisted, shared by all paths
+float weight   = boundary / ((float)n_vols_at_curr_priority);     // 1/n lives HERE, only
+area_density[field_material_index[f]] +=
+    boundary * tex3D<float>(field_texs[f], fx + 0.5f, fy + 0.5f, fz + 0.5f);
+```
+
+| decision | reason |
+|---|---|
+| **`boundary`, never `weight`** | `1/n` exists because n volumes at one priority are competing descriptions of the *same* matter. A density field carries matter no volume has, so inheriting `1/n` would make an iodine bolus half as dense wherever two volumes happen to overlap — a plausible image, no error. Splitting the two factors at the source makes it structurally impossible rather than a comment |
+| **`+ 0.5f`, and no offset on the base index** | The same texel-centre correction the linear volume-density fetch makes. After item 1 there is exactly **one** sampling convention in this kernel, which is why item 1 had to land first |
+| **inside `if (!inside_mesh)`** | A subtractive mesh means "this matter is displaced". A catheter body displaces blood *and* the iodine dissolved in it. No mosaic mesh sets `subtractive` today, so this is currently a no-op — decided rather than left to accident |
+| **compile-time `-D NUM_DENSITY_FIELDS={n}`, runtime material index** | Mirrors `MESH_ADDITIVE_ENABLED` for the count and `priority[]` for the index, so changing *which* material a field carries does not recompile. Parameters are always in the signature; only the bodies are `#if`-guarded, so there is one arg list rather than two |
+| **not a `Renderable`, not in the `volume` list** | It has no priority and is not composited by the priority rule. A separate argument keeps `Projector([ct, mesh, ...])` semantics untouched and stops "just add a second `Volume`" from looking like the same thing |
+| **generic material, not hard-coded iodine** | The same code renders a continuous calcium field or an air field with no further fork change. `NUM_MATERIALS` grows by one per new material (4 → 5 on mosaic's cases), not to a bin count |
+| **IJK shape in, KJI array out** | `create_cuda_texture` builds `CUDAarray(desc, *shape[::-1])`, so the density array is held in texture order throughout and `update()` is a pure copy. Transposing 128 MiB per frame would cost more than the copy it feeds. `field.empty()` hands out the correctly ordered array and the shape guard makes the mistake loud |
+
+`update()` **raises** on wrong shape (naming the transpose), wrong dtype, a non-contiguous
+array, NaN, any negative value, a non-finite value, and a **nonzero boundary shell** — which
+means the material is being clipped at the field's own box and the line integral is short.
+`Projector.update_contrast` raises if no field was supplied at construction rather than
+silently doing nothing, and `Projector.__init__` raises when a density field and a **mesh**
+carry the same material, because both paths add into the same `area_density[m]` and the
+result is double-counted (`allow_density_field_material_overlap=True` for a deliberate
+side-by-side comparison).
+
+### The measurement
+
+`sim/fluoro_sim/qa/density_field_report.py` in mosaic (P2's five checkpoints) and
+`sim/tests/test_fluoro_sim_density_field.py` (54 CPU tests: the grid contract, every array
+guard, the materials plumbing, and a source guard on the three kernel lines above). Measured on an NVIDIA L4,
+2026-08-11.
+
+| # | check | result |
+|---|---|---|
+| 1 | **Inert at `NUM_DENSITY_FIELDS = 0`** | **bit-identical.** PAT_23 at 512 px, mesh-free (a mesh would measure DeepDRR's OpenGL peel coin-flip instead): 0 of 262 144 px move, max \|diff\| **0.000e+00**, sha256 `0bbdb880…` either side. Render 0.081 s against the 0.086 s bare-volume baseline |
+| 2 | **Analytic slab vs a polychromatic hand calculation** | **worst relative error 0.01%** over 10–200 mg I/mL. A 20 mm iodine slab behind 20 cm of soft tissue: 100 mg/mL measures **1.3163** against **1.3162** predicted. The background is 100.03% of its own prediction, i.e. the quadrature lands within one 0.1 mm step of the 200 mm chord |
+| 2b | **`boundary` and not `weight`** | With **two** identical volumes at one priority (`n_vols_at_curr_priority = 2`) every row is **identical to the one-volume run**. Under `weight` the iodine would have halved. This is the check the design is written around |
+| 3 | **`update_contrast` on a live `Projector`** | monotone over 6 states; `Projector.initialize` calls **1**, from a counter, not an assertion; the texture pointer never changes. 0.9–1.4 ms per update, 0.017 s per render |
+| 4 | **The guards** | **20 of 20** fire, each with a message naming the fix |
+| 5 | **`enabled = False`** | **bit-identical** to a zero-filled field, to itself after a toggle, and to a `Projector` built with **no field at all** — across a `NUM_MATERIALS` change, because the extra `area_density` term is 0 and sorts first. The field was really on: 1.3163 units at 100 mg I/mL |
+| + | **the additive-mesh path is untouched** | `qa/additive_iodine_smoke.py` C1–C3 reproduce mosaic's P1 record digit for digit: deltas 0.0000 → 2.3166, and delta att **1.1102** at 4/10/20/40 segments |
+
+**Per-frame `update()` cost, and one correction to expectations.** The raw copy is measured
+by the harness that already owns that number (`qa/render_cost_report.py::measure_texture_copy`),
+so the split is measured rather than inferred:
+
+| grid | MiB | `update()` | raw D2D | of which guards | raw H2D |
+|---|---|---|---|---|---|
+| 20 × 12 × 28 | 0.03 | 0.71–0.97 ms | 0.02 ms | 0.70–0.95 ms | 0.03 ms |
+| 181 × 142 × 1307 (PAT_23's lumen box) | 128 | **2.83 / 2.84 / 2.85 ms** | 1.14 / 1.15 / 1.14 ms | **1.98 / 1.91 / 1.93 ms** | 25.0 / 25.9 / 25.9 ms |
+
+Three runs, so the spread is visible rather than implied: the split is stable to ±0.04 ms.
+
+**The guards cost more than the copy.** They are 8 device reductions, so below ~1 MiB the
+cost is launch latency alone. A per-frame update is therefore **~2.84 ms, not the 1.12 ms**
+the plan projected from the copy alone — still 2% of a 130 ms render, and they are not made
+optional: a NaN or a negative density reads as a physics result rather than as an error,
+which is the whole reason they exist.
+
+### What it does not change
+
+Every existing caller compiles the field sampling out and gets the same image, byte for byte
+(checkpoint 1) — the extra kernel parameters and the hoisted `boundary` are free. The
+`boundary`/`weight` split is exact rather than merely equivalent: `1.0f/n` then `* 0.5f`
+equals `0.5f/n` in IEEE single precision for every n, because halving is exact and division
+rounding is scale-invariant across powers of two. Mosaic renders with one volume, so
+`n = 1` anyway.
+
+The new materials block sits in the middle of `Projector.__init__`'s `all_mats` assembly, and
+the two upstream behaviours on either side of it — `attenuate_outside_volume` registering
+`"air"`, and the name-keyed `all_materials.sort()` — are now pinned by tests, because the
+first version of this change deleted the former by accident and no render could have shown it.
+
+### Two things left alone on purpose
+
+1. `voxels[][][]` and `previous_coordinates[]` are declared **outside** the `vol_id` loop and
+   written **inside** it, so with `NUM_VOLUMES > 1` volume 1 can reuse volume 0's labels
+   wherever their base coordinates coincide. This change makes checkpoint 2b run at
+   `NUM_VOLUMES = 2` — with two **identical** grids, so the latent bug is inert there and
+   the check is unaffected. It is a separate fork change with its own test; it is not made
+   worse and it is not fixed here.
+2. `gVoxelElementSize{X,Y,Z}` is passed to the kernel and never used. The field parameters
+   deliberately do **not** imitate it: a field needs no voxel size in the kernel, because
+   `alpha` is a world-unit ray and the box test is in IJK.

@@ -330,6 +330,7 @@ def _get_kernel_projector_module(
     air_index: int,
     attenuate_outside_volume: bool = False,
     ijk_sample_offset: Optional[float] = None,
+    num_density_fields: int = 0,
 ) -> cp.RawModule:
     """Compile the cuda code for the kernel projector.
 
@@ -339,6 +340,10 @@ def _get_kernel_projector_module(
     Args:
         num_volumes (int): The number of volumes to assume
         num_materials (int): The number of materials to assume
+        num_density_fields (int): The number of additive material-density fields
+            (`deepdrr.vol.AdditiveDensityField`). 0, the default, compiles the field
+            sampling out entirely, so the kernel is today's kernel; the parameters are in
+            the signature either way. Mosaic fork item 2.
         ijk_sample_offset (float, optional): Diagnostic override for the kernel's
             `IJK_SAMPLE_OFFSET`. `None` (the default, and the only value the library itself
             ever uses) leaves the kernel's own correct value of 0. Any other value renders a
@@ -386,6 +391,8 @@ def _get_kernel_projector_module(
         f"ATTENUATE_OUTSIDE_VOLUME={int(attenuate_outside_volume)}",
         "-D",
         f"AIR_INDEX={air_index}",
+        "-D",
+        f"NUM_DENSITY_FIELDS={int(num_density_fields)}",
         "-I",
         bicubic_path,
         "-I",
@@ -431,6 +438,8 @@ class Projector(object):
         mesh_layers=2,
         cuda_device_id=None,
         ijk_sample_offset: Optional[float] = None,
+        density_fields: Optional[List[vol.AdditiveDensityField]] = None,
+        allow_density_field_material_overlap: bool = False,
     ) -> None:
         """Create the projector, which has info for simulating the DRR.
 
@@ -468,6 +477,17 @@ class Projector(object):
                 (the default) uses. Set it only to render a deliberately misaligned volume;
                 `sim/fluoro_sim/qa/kernel_grid_alignment_report.py` sweeps it to measure that
                 0 is the value that aligns volume content with mesh content.
+            density_fields (List[AdditiveDensityField], optional): continuous per-voxel
+                additive material-density grids, sampled in the ray march and **added** to
+                their material's area density. Deliberately a separate argument rather than
+                entries in `volume`: a field is not composited by the priority rule and has
+                no priority, so putting it in the renderable list would invite exactly the
+                wrong intuition. Defaults to None (the kernel compiles the sampling out).
+            allow_density_field_material_overlap (bool, optional): permit a scene in which a
+                density field and a *mesh* carry the same material. That is double-counting
+                -- both paths add to the same `area_density[m]` -- so it raises by default.
+                Set it only for a deliberate side-by-side comparison of the two paths, and
+                do not render a dataset with it on. Defaults to False.
         """
 
         self._egl_platform = None
@@ -499,6 +519,35 @@ class Projector(object):
         log.info("volumes")
         log.info(self.volumes)
         self.mesh_additive_enabled = len(self.meshes) > 0
+
+        self.density_fields = list(density_fields) if density_fields else []
+        self.allow_density_field_material_overlap = bool(
+            allow_density_field_material_overlap
+        )
+        for i, _field in enumerate(self.density_fields):
+            if not isinstance(_field, vol.AdditiveDensityField):
+                raise ValueError(
+                    f"density_fields[{i}] is a {type(_field).__name__}; it must be a "
+                    f"deepdrr.vol.AdditiveDensityField. Renderables (Volume, Mesh) go in the "
+                    f"first argument -- a density field is added, not composited, so it is "
+                    f"deliberately a different type in a different argument."
+                )
+        if self.density_fields and not self.volumes:
+            # The ray march, num_steps and the whole sample loop live inside
+            # `#if NUM_VOLUMES > 0`. A field with no volume would compile and render nothing.
+            raise ValueError(
+                f"{len(self.density_fields)} density field(s) were given with no Volume. The "
+                f"kernel's ray march exists only when there is at least one volume (it is "
+                f"what defines minAlpha/maxAlpha and num_steps), so the field would silently "
+                f"contribute nothing. Add a Volume covering the region -- a uniform air block "
+                f"is enough for a field-only test scene."
+            )
+        if len(self.density_fields) != len({id(f) for f in self.density_fields}):
+            raise ValueError(
+                "the same AdditiveDensityField was passed twice in density_fields. Each field "
+                "owns one CUDAarray, so the duplicate would sample the same grid twice and "
+                "double its contribution. Pass it once, or build a second field."
+            )
         # self.mesh_subtractive_enabled = False
 
         # for prim in self.primitives:
@@ -572,6 +621,27 @@ class Projector(object):
 
         if attenuate_outside_volume:
             all_mats.append("air")
+
+        # Before the set()/sort() below, so a field's material joins `all_materials` on the
+        # same footing as a volume's or a mesh's. Everything downstream is keyed by NAME --
+        # the Material.from_string assertion loop, absorption_coef_table, the segmentation
+        # label remap, prim_unique_materials_indices -- so nothing else needs to change, and
+        # NUM_MATERIALS grows by at most one per new material, not to a bin count.
+        mesh_materials = {prim.material.drrMatName for prim in self.primitives}
+        for _field in self.density_fields:
+            all_mats.append(_field.material)
+            if (
+                _field.material in mesh_materials
+                and not self.allow_density_field_material_overlap
+            ):
+                raise ValueError(
+                    f"material {_field.material!r} is carried by BOTH a density field and a "
+                    f"mesh in this scene. Both paths add into area_density[{_field.material!r}], "
+                    f"so the result is double-counted rather than either one of them. Render "
+                    f"the field or the meshes, not both. If this really is a deliberate "
+                    f"side-by-side comparison, pass "
+                    f"allow_density_field_material_overlap=True and do not export the frames."
+                )
 
         self.all_materials = list(set(all_mats))
         self.all_materials.sort()
@@ -693,6 +763,12 @@ class Projector(object):
         for vol_id, _vol in enumerate(self.volumes):
             self.volume_enabled_gpu[vol_id] = 1 if _vol.enabled else 0
 
+        # Same for the density fields, so `field.enabled = False` is a per-render toggle: a
+        # DSA mask frame is the same scene with contrast off, which is one int rather than
+        # zeroing and re-uploading the whole grid.
+        for field_id, _field in enumerate(self.density_fields):
+            self.field_enabled_gpu[field_id] = 1 if _field.enabled else 0
+
         intensities = []
         photon_probs = []
         for i, proj in enumerate(camera_projections):
@@ -772,6 +848,21 @@ class Projector(object):
             np.int32(len(self.prim_unique_materials)),
             # np.int32(self.mesh_layers),
             # np.int32(self.max_mesh_hits),
+            # Additive material-density fields. Always passed, even when there are none:
+            # the kernel's signature does not change with NUM_DENSITY_FIELDS, only its body.
+            np.uint64(self.field_texobs_gpu.data.ptr),  # field_texs
+            np.uint64(self.field_enabled_gpu.data.ptr),  # field_enabled
+            np.uint64(self.field_material_index_gpu.data.ptr),  # field_material_index
+            np.uint64(self.field_ijk_from_world_gpu.data.ptr),  # field_ijk_from_world
+            np.uint64(self.field_sourceX_gpu.data.ptr),  # field_sx_ijk
+            np.uint64(self.field_sourceY_gpu.data.ptr),  # field_sy_ijk
+            np.uint64(self.field_sourceZ_gpu.data.ptr),  # field_sz_ijk
+            np.uint64(self.field_minPointX_gpu.data.ptr),  # field_min_point_x
+            np.uint64(self.field_minPointY_gpu.data.ptr),  # field_min_point_y
+            np.uint64(self.field_minPointZ_gpu.data.ptr),  # field_min_point_z
+            np.uint64(self.field_maxPointX_gpu.data.ptr),  # field_max_point_x
+            np.uint64(self.field_maxPointY_gpu.data.ptr),  # field_max_point_y
+            np.uint64(self.field_maxPointZ_gpu.data.ptr),  # field_max_point_z
         ]
 
         # Calculate required blocks
@@ -818,6 +909,49 @@ class Projector(object):
 
         return collected_energy_data, photon_prob
 
+    def update_contrast(self, rho: Any, field: Union[int, str] = 0) -> None:
+        """Replace a density field's grid on a **live** Projector. One `cudaMemcpy3D`.
+
+        Nothing is re-initialized: not the texture, not the kernel, not the volume. So a
+        sequence of contrast states costs one volume upload plus N of these plus N renders,
+        which is the whole economic argument for the density channel.
+
+        Args:
+            rho: the new densities in `g/cm^3`, in the field's **texture (KJI) order** --
+                get one from `field.empty()`. A cupy device array is the fast path; a numpy
+                host array works and costs about 20x more. Validated in full first
+                (`deepdrr.vol.validate_density_array`).
+            field: which field, by index into `density_fields` or by material name.
+                Defaults to 0, the only field in a one-field scene.
+
+        Raises:
+            RuntimeError: if the Projector was built with no density fields, rather than
+                silently doing nothing -- a caller who forgot the constructor argument would
+                otherwise get a plausible contrast-free image and no signal.
+        """
+        if not self.density_fields:
+            raise RuntimeError(
+                "update_contrast() was called on a Projector built with no density fields, so "
+                "there is nothing to update and the image would not change. Pass the field at "
+                "construction: Projector(volume, ..., density_fields=[field])."
+            )
+        if isinstance(field, str):
+            names = [f.material for f in self.density_fields]
+            if names.count(field) != 1:
+                raise ValueError(
+                    f"no single density field carries material {field!r}; this Projector has "
+                    f"{names}. Address it by index instead if two fields share a material."
+                )
+            index = names.index(field)
+        else:
+            index = int(field)
+            if not -len(self.density_fields) <= index < len(self.density_fields):
+                raise IndexError(
+                    f"density field index {index} is out of range for the "
+                    f"{len(self.density_fields)} field(s) this Projector was built with."
+                )
+        self.density_fields[index].update(rho)
+
     def _update_object_locations(self, proj: geo.CameraProjection) -> None:
         world_from_index = np.array(proj.world_from_index[:-1, :]).astype(np.float32)
         self.world_from_index_gpu = cp.asarray(world_from_index)
@@ -848,6 +982,33 @@ class Projector(object):
         self.sourceX_gpu = cp.asarray(sourceX)
         self.sourceY_gpu = cp.asarray(sourceY)
         self.sourceZ_gpu = cp.asarray(sourceZ)
+
+        # The same two quantities for each density field. Per projection, not per init: the
+        # field does not move, but the source does, and the kernel needs the source in each
+        # field's own IJK to run the slab test and step the ray.
+        if self.density_fields:
+            field_sourceX = np.zeros(len(self.density_fields), dtype=np.float32)
+            field_sourceY = np.zeros(len(self.density_fields), dtype=np.float32)
+            field_sourceZ = np.zeros(len(self.density_fields), dtype=np.float32)
+            field_ijk_from_world_cpu = np.zeros(
+                len(self.density_fields) * 3 * 4, dtype=np.float32
+            )
+            for field_id, _field in enumerate(self.density_fields):
+                source_ijk = np.array(
+                    _field.IJK_from_world @ proj.center_in_world
+                ).astype(np.float32)
+                field_sourceX[field_id] = source_ijk[0]
+                field_sourceY[field_id] = source_ijk[1]
+                field_sourceZ[field_id] = source_ijk[2]
+
+                IJK_from_world = _field.IJK_from_world.toarray()
+                field_ijk_from_world_cpu[
+                    IJK_from_world.size * field_id : IJK_from_world.size * (field_id + 1)
+                ] = IJK_from_world.flatten()
+            self.field_ijk_from_world_gpu = cp.asarray(field_ijk_from_world_cpu)
+            self.field_sourceX_gpu = cp.asarray(field_sourceX)
+            self.field_sourceY_gpu = cp.asarray(field_sourceY)
+            self.field_sourceZ_gpu = cp.asarray(field_sourceZ)
 
     def _calculate_collected_energy_per_pixel(
         self, proj: geo.CameraProjection, intensity: np.ndarray
@@ -1457,6 +1618,7 @@ class Projector(object):
             air_index=self.air_index,
             attenuate_outside_volume=self.attenuate_outside_volume,
             ijk_sample_offset=self.ijk_sample_offset,
+            num_density_fields=len(self.density_fields),
         )
         self.project_kernel = self.mod.get_function("projectKernel")
 
@@ -1575,6 +1737,52 @@ class Projector(object):
         self.prim_unique_materials_gpu = cp.array(
             self.prim_unique_materials_indices, dtype=np.int32
         )
+
+        # --- additive material-density fields (mosaic fork item 2) ------------------------
+        # One resident float32 CUDAarray + linear texture per field, plus the per-field
+        # arrays that mirror the per-volume ones. All allocated at least length 1: a
+        # zero-length cupy array has no meaningful .data.ptr, and the kernel takes these
+        # pointers unconditionally even at NUM_DENSITY_FIELDS == 0.
+        n_fields = len(self.density_fields)
+        for _field in self.density_fields:
+            _field.initialize()
+        self.field_texobs_gpu = cp.array(
+            [f.texture_pointer for f in self.density_fields] or [0], dtype=np.uint64
+        )
+        # Refreshed on every project() from field.enabled, like volume_enabled_gpu.
+        self.field_enabled_gpu = cp.ones(max(1, n_fields), dtype=np.int32)
+        # A RUNTIME array, not a -D: which material a field carries can change without a
+        # recompile, exactly as a volume's priority can.
+        self.field_material_index_gpu = cp.array(
+            [self.all_materials.index(f.material) for f in self.density_fields] or [0],
+            dtype=np.int32,
+        )
+        self.field_ijk_from_world_gpu = cp.zeros(max(1, n_fields) * 3 * 4, dtype=np.float32)
+        self.field_sourceX_gpu = cp.zeros(max(1, n_fields), dtype=np.float32)
+        self.field_sourceY_gpu = cp.zeros(max(1, n_fields), dtype=np.float32)
+        self.field_sourceZ_gpu = cp.zeros(max(1, n_fields), dtype=np.float32)
+        self.field_minPointX_gpu = cp.zeros(max(1, n_fields), dtype=np.float32)
+        self.field_minPointY_gpu = cp.zeros(max(1, n_fields), dtype=np.float32)
+        self.field_minPointZ_gpu = cp.zeros(max(1, n_fields), dtype=np.float32)
+        self.field_maxPointX_gpu = cp.zeros(max(1, n_fields), dtype=np.float32)
+        self.field_maxPointY_gpu = cp.zeros(max(1, n_fields), dtype=np.float32)
+        self.field_maxPointZ_gpu = cp.zeros(max(1, n_fields), dtype=np.float32)
+        for i, _field in enumerate(self.density_fields):
+            lower, upper = _field.get_bounding_box_in_ijk()
+            self.field_minPointX_gpu[i] = np.float32(lower[0])
+            self.field_minPointY_gpu[i] = np.float32(lower[1])
+            self.field_minPointZ_gpu[i] = np.float32(lower[2])
+            self.field_maxPointX_gpu[i] = np.float32(upper[0])
+            self.field_maxPointY_gpu[i] = np.float32(upper[1])
+            self.field_maxPointZ_gpu[i] = np.float32(upper[2])
+        if n_fields:
+            log.debug(
+                f"{n_fields} density field(s): "
+                + ", ".join(
+                    f"{f.material!r} {f.shape} = {f.nbytes / 1024 ** 2:.1f} MiB"
+                    for f in self.density_fields
+                )
+            )
 
         init_tock = time.perf_counter()
         log.debug(
@@ -1745,6 +1953,24 @@ class Projector(object):
             self.volumes_texarrs = None
             self.seg_texobs = None
             self.seg_texarrs = None
+
+            # The field object outlives the Projector (it carries the grid geometry and can
+            # be attached to the next one); its GPU memory does not.
+            for _field in self.density_fields:
+                _field.free()
+            self.field_texobs_gpu = None
+            self.field_enabled_gpu = None
+            self.field_material_index_gpu = None
+            self.field_ijk_from_world_gpu = None
+            self.field_sourceX_gpu = None
+            self.field_sourceY_gpu = None
+            self.field_sourceZ_gpu = None
+            self.field_minPointX_gpu = None
+            self.field_minPointY_gpu = None
+            self.field_minPointZ_gpu = None
+            self.field_maxPointX_gpu = None
+            self.field_maxPointY_gpu = None
+            self.field_maxPointZ_gpu = None
 
             self.mesh_sub_layer_valid = None
             self.mesh_hit_alphas_gpu = None
