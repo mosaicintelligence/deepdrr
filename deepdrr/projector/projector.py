@@ -952,6 +952,80 @@ class Projector(object):
                 )
         self.density_fields[index].update(rho)
 
+    def replace_mesh(self, old: vol.Mesh, new: vol.Mesh) -> None:
+        """Swap one renderable Mesh on a **live** Projector. No re-initialization.
+
+        Mesh *geometry* used to be baked in: `initialize` adds each mesh to the pyrender
+        scene once and nothing could change that list afterwards, so a new tool pose meant
+        a new Projector -- a full volume upload (~1.7 s on a cropped PAT_23) to move a mesh
+        whose vertex buffers upload in under 50 ms. The GL side never needed that:
+        `pyrenderdrr.Renderer._update_context` diffs `scene.meshes` against what it has in
+        context on EVERY render, uploading new VBOs and deleting the old ones. This method
+        is only the Projector bookkeeping that was missing; the next render does the GPU
+        work. Measured bit-identical to a fresh Projector -- mosaic fork item 4,
+        `sim/fluoro_sim/qa/mesh_swap_report.py`.
+
+        What is still fixed at `initialize`, and therefore guarded here, is the **material
+        set**: `NUM_MATERIALS` is a `-D` on the kernel, and the absorption table and the
+        per-material additive-density framebuffers are sized from it. `MESH_ADDITIVE_ENABLED`
+        is fixed too, but a replacement needs an existing mesh, so it is always on. Any
+        geometry is accepted: `new` may have a different vertex count, primitive count or
+        tag set from `old`.
+
+        Args:
+            old: a Mesh this Projector was constructed with, or one a previous call swapped
+                in. Matched by identity.
+            new: its replacement. Every primitive must carry a `DRRMaterial` whose
+                `drrMatName` is one the Projector was initialized with. It enters the scene
+                enabled, whatever `old.enabled` was.
+
+        Raises:
+            RuntimeError: before `initialize()` -- pass the mesh to the constructor instead.
+            ValueError: `old` is not in this Projector, `new is old`, a primitive's material
+                is not a `DRRMaterial`, or `new` carries a material the kernel was not
+                compiled with -- that needs a new Projector.
+        """
+        if not self.initialized:
+            raise RuntimeError(
+                "replace_mesh() before initialize(): there is no scene to swap into. Pass "
+                "the mesh to the constructor instead."
+            )
+        if new is old:
+            raise ValueError(
+                "replace_mesh() was given the same Mesh as old and new. A Mesh mutated in "
+                "place is not a change the scene can see; build a new Mesh."
+            )
+        if old not in self.meshes:
+            raise ValueError(
+                f"replace_mesh(): `old` is not one of this Projector's {len(self.meshes)} "
+                f"meshes. Pass the Mesh the Projector was built with, or the one the "
+                f"previous replace_mesh() swapped in."
+            )
+        for prim in new.mesh.primitives:
+            if not isinstance(prim.material, DRRMaterial):
+                raise ValueError(f"unrecognized material type: {type(prim.material)}.")
+        missing = sorted(
+            {prim.material.drrMatName for prim in new.mesh.primitives}
+            - set(self.prim_unique_materials)
+        )
+        if missing:
+            raise ValueError(
+                f"the new mesh carries material(s) {missing} that this Projector was not "
+                f"initialized with ({self.prim_unique_materials}). NUM_MATERIALS, the "
+                f"absorption table and the additive-density framebuffers are sized at "
+                f"initialize, so a new material needs a new Projector."
+            )
+
+        index = self.meshes.index(old)
+        self.scene.remove_node(self.mesh_nodes[index])  # takes its child mesh node with it
+        node = Node()
+        self.scene.add_node(node)
+        new.mesh.originmesh = new
+        self.scene.add(new.mesh, parent_node=node)
+        self.meshes[index] = new
+        self.mesh_nodes[index] = node
+        self.primitives = [prim for mesh in self.meshes for prim in mesh.mesh.primitives]
+
     def _update_object_locations(self, proj: geo.CameraProjection) -> None:
         world_from_index = np.array(proj.world_from_index[:-1, :]).astype(np.float32)
         self.world_from_index_gpu = cp.asarray(world_from_index)

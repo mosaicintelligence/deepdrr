@@ -305,3 +305,72 @@ single-render script and roughly 2x to a dataset export.
 python -m sim.fluoro_sim.qa.render_cost_report --frames 20 --skip-per-call   # the upload
 python -m sim.fluoro_sim.qa.density_field_report --only 1                    # bit-identity
 ```
+
+---
+
+## 4. `Projector.replace_mesh`: a new tool pose no longer costs a volume upload
+
+**Landed** 2026-08-21. **File:** `deepdrr/projector/projector.py`.
+
+Pure performance. **No rendered pixel changes** — measured, not assumed (below).
+
+### The change
+
+Mesh *geometry* was baked in: `initialize` adds each `pyrender.Mesh` to the scene once and
+nothing could change that list afterwards, so a dataset that varies the tool pose built one
+`Projector` per pose and paid a full volume upload each time — 1.5–3 s on a cropped case — to
+move a mesh whose vertex buffers upload in under 50 ms.
+
+The GL side never needed that. `pyrenderdrr.Renderer._update_context` diffs `scene.meshes`
+against the primitives it has in context on **every** render, uploading new vertex buffers and
+deleting removed ones. Only the `Projector` bookkeeping was missing:
+
+```python
+projector.replace_mesh(old, new)   # old: a Mesh it holds; new: same material set, any geometry
+```
+
+removes `old`'s scene node, adds `new` under a fresh one, and updates `meshes`, `mesh_nodes`
+and `primitives`. The next render does the GPU work.
+
+| decision | reason |
+|---|---|
+| **an explicit method, not a mutable `Mesh.mesh`** | A setter synced at render time would surface a material error one render late, and `Mesh.get_bounding_AABB` is a `cached_property` that would go stale. `update_contrast` (item 2) is the precedent: state changes on a live Projector are explicit calls |
+| **the material set is guarded** | `NUM_MATERIALS` is a `-D` on the kernel, and the absorption table and the per-material additive-density framebuffers are sized from it at `initialize`. A new material raises, naming the fix (a new Projector) |
+| **any geometry accepted** | vertex count, primitive count and tag set may all change, so both "re-solve at a new depth" (node count changes) and "advance a live solver" (fixed count) are one call |
+| **no `add_mesh` / `remove_mesh`** | `MESH_ADDITIVE_ENABLED` is compiled in, so adding to a mesh-free Projector would be a different change; absence is already `mesh.enabled = False` |
+| **no in-place vertex-buffer update** | unnecessary: the first render after a swap is within noise of a steady one (below) |
+
+### The measurement
+
+`sim/fluoro_sim/qa/mesh_swap_report.py` in mosaic. NVIDIA L4, 2026-08-21, mosaic's PAT_23
+cropped to its illuminated box (512 × 512 × 1063), custom materials, 1024 px AP + LAT, a
+guidewire and a coaxial catheter at three depths on each iliac branch. Every pose rendered
+through **one** Projector after a swap is compared with a **fresh** Projector of the same scene:
+
+| check | result |
+|---|---|
+| swapped pose vs fresh Projector, both views, every pose | **0 of 1 048 576 px differ** in each view — including the other branch, which has its own cameras and pixel size |
+| `project_seg` masks, every tag | identical |
+| back to the first pose after five swaps | 0 px differ from that pose's first render |
+| the swap itself | **0.38–0.45 ms** |
+| first render after a swap vs steady render | 0.86–0.88 s vs 0.86–0.88 s (the vertex upload is in the noise) |
+| 20 further swap + render cycles | device memory 3548 → 3557 MiB: the old buffers are freed |
+| what a fresh Projector cost instead | `initialize` **2.70–3.39 s** per pose on this scene |
+
+End to end through `cli/export_dataset.py` (2 cases × 6 poses × 2 views × 3 modalities, one
+session per **case** instead of per pose), the run before and the run after this change were
+compared file by file: **0 of 432** images, masks and previews differ, and `poses.jsonl` /
+`frames.jsonl` are identical. `volume_uploads` 6 → 1 per case; `projector_init_s` 9.2 → 1.6 s
+and 10.7 → 2.3 s; wall clock 309 → 290 s.
+
+**Honest framing of that last number.** After the crop and item 3 the upload was ~10% of the
+batch export's wall clock; the rod solve (33 and 59 s per case) and the renders (28 and 32 s)
+dominate it. What this change buys is the *sequence* case: N poses of one anatomy now cost
+one upload plus N renders at the steady 0.87 s, instead of N uploads.
+
+### The mosaic-side reproducer
+
+```bash
+python -m sim.fluoro_sim.qa.mesh_swap_report --case-id PAT_23_threshold128   # the table
+FLUORO_SIM_RUN_GPU=1 pytest sim/tests/test_fluoro_sim_gpu_render.py -k replace_mesh
+```
