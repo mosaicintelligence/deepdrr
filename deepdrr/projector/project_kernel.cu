@@ -6,9 +6,43 @@
 #define AIR_DENSITY 0.1129
 #endif
 
+// Offset added to the IJK ray coordinate before the per-step texture fetches.
+//
+// **The only correct value is 0.** Voxel n is centred at IJK n -- that is what the volume's
+// own declared bounds say (gVolumeEdgeMinPoint = -0.5, gVolumeEdgeMaxPoint = shape - 0.5) and
+// what Volume.ijk_from_world produces. The two fetches below then need different corrections,
+// and each already applies its own:
+//
+//   * the DENSITY fetch is linear-filtered, so it needs the texel-centre +0.5f -- and adds it
+//     itself (`px[vol_id] + 0.5f`);
+//   * the LABEL fetch is point-sampled, so tex3D<int> returns element floor(coord) and needs
+//     no correction at all -- it reads floor(q) and floor(q)+1 directly.
+//
+// This macro exists only so qa/kernel_grid_alignment_report.py can sweep it and *measure*
+// that 0 is correct, instead of asserting it in a comment. Nothing in the library sets it.
+// See MOSAIC_FORK_CHANGES.md item 1 for the measurement and the upstream history.
+#ifndef IJK_SAMPLE_OFFSET
+#define IJK_SAMPLE_OFFSET (0.0f)
+#endif
+
 // #define NUM_VOLUMES 1 // default for syntax highlighting
 // #define MESH_ADDITIVE_AND_SUBTRACTIVE_ENABLED 1 // default for syntax highlighting
 // #define MESH_ADDITIVE_ENABLED 1 // default for syntax highlighting
+
+// Number of additive material-density fields (mosaic fork item 2).
+//
+// A density field is a float32 g/cm^3 grid of ONE named material, sampled once per ray step
+// and ADDED to that material's area density -- so it renders a continuous concentration
+// (an iodine bolus, a calcium distribution) that the per-voxel material label cannot carry.
+// See deepdrr/vol/additive_density_field.py and MOSAIC_FORK_CHANGES.md item 2.
+//
+// The field parameters are ALWAYS in projectKernel's signature; only the bodies below are
+// guarded. So at NUM_DENSITY_FIELDS = 0 -- the default, and what every existing caller
+// gets -- this file compiles to today's kernel and Python passes a few extra unused
+// pointers. There is one arg list, not two.
+#ifndef NUM_DENSITY_FIELDS
+#define NUM_DENSITY_FIELDS 0
+#endif
 
 extern "C" {
 __device__ static void calculate_solid_angle(const float *world_from_index, // (3, 3) array giving the world_from_index ray
@@ -177,6 +211,25 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
               const int mesh_unique_material_count, // number of unique materials for additive mesh
             //   const int mesh_layers,
             //   const int max_mesh_depth, // maximum number of mesh hits per pixel
+              // --- additive material-density fields (mosaic fork item 2) -------------------
+              // Always present, even at NUM_DENSITY_FIELDS == 0; see the macro at the top.
+              // Each field is a grid of ONE material with its OWN full transform -- these
+              // mirror the per-volume arrays above one for one, because that is what they
+              // are.
+              const cudaTextureObject_t * __restrict__ field_texs, // (NUM_DENSITY_FIELDS,) float32, linear
+              const int * __restrict__ field_enabled, // 1 = sample this render, 0 = skip
+              const int * __restrict__ field_material_index, // index into area_density[]; RUNTIME, so
+                                     // changing which material a field carries does not recompile
+              const float * __restrict__ field_ijk_from_world, // (NUM_DENSITY_FIELDS, 3, 4)
+              const float * __restrict__ field_sx_ijk, // source point in each field's IJK
+              const float * __restrict__ field_sy_ijk,
+              const float * __restrict__ field_sz_ijk,
+              const float * __restrict__ field_min_point_x, // the field's box in its own IJK,
+              const float * __restrict__ field_min_point_y, // cell-centred like the volumes':
+              const float * __restrict__ field_min_point_z, // -0.5 .. shape - 0.5
+              const float * __restrict__ field_max_point_x,
+              const float * __restrict__ field_max_point_y,
+              const float * __restrict__ field_max_point_z,
               const int offsetW, 
               const int offsetH) {
     // The output image has the following coordinate system, with cell-centered
@@ -330,6 +383,87 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
 
     // printf("global min, max alphas: %f, %f\n", minAlpha, maxAlpha);
 
+#if NUM_DENSITY_FIELDS > 0
+    // Part 1b: the same slab test for each density field's box, in the field's OWN IJK, and
+    // minAlpha/maxAlpha are EXTENDED to cover it. A field the ray reaches but no volume does
+    // would otherwise be a silent no-render: num_steps below is derived from these two.
+    float field_rx[NUM_DENSITY_FIELDS];
+    float field_ry[NUM_DENSITY_FIELDS];
+    float field_rz[NUM_DENSITY_FIELDS];
+    float field_sx[NUM_DENSITY_FIELDS];
+    float field_sy[NUM_DENSITY_FIELDS];
+    float field_sz[NUM_DENSITY_FIELDS];
+    float field_min_alpha[NUM_DENSITY_FIELDS];
+    float field_max_alpha[NUM_DENSITY_FIELDS];
+    int field_do_trace[NUM_DENSITY_FIELDS];
+
+    for (int f = 0; f < NUM_DENSITY_FIELDS; f++) {
+        field_sx[f] = field_sx_ijk[f];
+        field_sy[f] = field_sy_ijk[f];
+        field_sz[f] = field_sz_ijk[f];
+        field_min_alpha[f] = 0;
+        field_max_alpha[f] = 0;
+
+        // A disabled field is skipped here as well as in the sample loop, so a DSA mask
+        // frame does not even pay for the box test.
+        field_do_trace[f] = (field_enabled[f] == 0) ? 0 : 1;
+        if (0 == field_do_trace[f]) {
+            continue;
+        }
+
+# define FIELD_OFFS 12
+        field_rx[f] = field_ijk_from_world[FIELD_OFFS * f + 0] * rx + field_ijk_from_world[FIELD_OFFS * f + 1] * ry +
+                      field_ijk_from_world[FIELD_OFFS * f + 2] * rz;
+        field_ry[f] = field_ijk_from_world[FIELD_OFFS * f + 4] * rx + field_ijk_from_world[FIELD_OFFS * f + 5] * ry +
+                      field_ijk_from_world[FIELD_OFFS * f + 6] * rz;
+        field_rz[f] = field_ijk_from_world[FIELD_OFFS * f + 8] * rx + field_ijk_from_world[FIELD_OFFS * f + 9] * ry +
+                      field_ijk_from_world[FIELD_OFFS * f + 10] * rz;
+
+        field_min_alpha[f] = 0;
+        field_max_alpha[f] = max_ray_length > 0 ? max_ray_length : INFINITY;
+
+        if (0.0f != field_rx[f]) {
+            reci = 1.0f / field_rx[f];
+            alpha0 = (field_min_point_x[f] - field_sx[f]) * reci;
+            alpha1 = (field_max_point_x[f] - field_sx[f]) * reci;
+            field_min_alpha[f] = fmax(field_min_alpha[f], fmin(alpha0, alpha1));
+            field_max_alpha[f] = fmin(field_max_alpha[f], fmax(alpha0, alpha1));
+        } else if (field_min_point_x[f] > field_sx[f] || field_sx[f] > field_max_point_x[f]) {
+            field_do_trace[f] = 0;
+            continue;
+        }
+        if (0.0f != field_ry[f]) {
+            reci = 1.0f / field_ry[f];
+            alpha0 = (field_min_point_y[f] - field_sy[f]) * reci;
+            alpha1 = (field_max_point_y[f] - field_sy[f]) * reci;
+            field_min_alpha[f] = fmax(field_min_alpha[f], fmin(alpha0, alpha1));
+            field_max_alpha[f] = fmin(field_max_alpha[f], fmax(alpha0, alpha1));
+        } else if (field_min_point_y[f] > field_sy[f] || field_sy[f] > field_max_point_y[f]) {
+            field_do_trace[f] = 0;
+            continue;
+        }
+        if (0.0f != field_rz[f]) {
+            reci = 1.0f / field_rz[f];
+            alpha0 = (field_min_point_z[f] - field_sz[f]) * reci;
+            alpha1 = (field_max_point_z[f] - field_sz[f]) * reci;
+            field_min_alpha[f] = fmax(field_min_alpha[f], fmin(alpha0, alpha1));
+            field_max_alpha[f] = fmin(field_max_alpha[f], fmax(alpha0, alpha1));
+        } else if (field_min_point_z[f] > field_sz[f] || field_sz[f] > field_max_point_z[f]) {
+            field_do_trace[f] = 0;
+            continue;
+        }
+
+        // The ray misses the box entirely (the slabs do not overlap).
+        if (field_min_alpha[f] > field_max_alpha[f]) {
+            field_do_trace[f] = 0;
+            continue;
+        }
+
+        minAlpha = fmin(minAlpha, field_min_alpha[f]);
+        maxAlpha = fmax(maxAlpha, field_max_alpha[f]);
+    }
+#endif
+
     // Part 2: Cast ray if it intersects any of the volumes
     int num_steps = ceil((maxAlpha - minAlpha) / step);
     // if (debug) printf("num_steps: %d\n", num_steps);
@@ -397,11 +531,11 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
     // trace (if doing the last segment separately, need to use num_steps - 1
     for (int t = 0; t < num_steps; t++) {
         for (int vol_id = 0; vol_id < NUM_VOLUMES; vol_id++) {
-            // we offset by -1.0f because we manually calculate the the trilinear filtering value in the surrounding area
-            // -0.5 offset for cuda texture and additional -0.5 offset to recenter for a standard grid
-            px[vol_id] = sx_ijk_local[vol_id] + alpha * rx_ijk[vol_id] - 1.0f;
-            py[vol_id] = sy_ijk_local[vol_id] + alpha * ry_ijk[vol_id] - 1.0f;
-            pz[vol_id] = sz_ijk_local[vol_id] + alpha * rz_ijk[vol_id] - 1.0f;
+            // Plain IJK, no correction: IJK_SAMPLE_OFFSET is 0. Each fetch below applies the
+            // correction its own filter mode needs -- see the macro's definition at the top.
+            px[vol_id] = sx_ijk_local[vol_id] + alpha * rx_ijk[vol_id] + IJK_SAMPLE_OFFSET;
+            py[vol_id] = sy_ijk_local[vol_id] + alpha * ry_ijk[vol_id] + IJK_SAMPLE_OFFSET;
+            pz[vol_id] = sz_ijk_local[vol_id] + alpha * rz_ijk[vol_id] + IJK_SAMPLE_OFFSET;
 
             // Reset segmentation values
             for (int mat_id = 0; mat_id < NUM_MATERIALS; mat_id++) {
@@ -516,6 +650,17 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
             }
         }
 
+        // The half-step boundary factor. For the entry boundary, multiply by 0.5: for the
+        // initial interpolated value, only a half step-size is considered in the
+        // computation. For the second-to-last interpolation point, also multiply by 0.5,
+        // since there will be a final step at the globalMaxAlpha boundary.
+        //
+        // This is a property of the QUADRATURE, so it is shared by every path along this
+        // ray and computed once here. It used to be folded into the volumes' `weight`
+        // below; splitting the two factors at the source is what lets the density-field
+        // loop take this one and *not* the 1/n -- see there.
+        float boundary = (0 == t || num_steps - 1 == t) ? 0.5f : 1.0f;
+
         // if (debug) printf("  got priority at alpha, num vols\n"); // This is
         // the one that seems to take a half a second.
         if (!inside_mesh) {
@@ -526,15 +671,13 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
                     area_density[AIR_INDEX] += AIR_DENSITY;
                 }
             } else {
-                // If multiple volumes at the same priority, use the average
-                float weight = 1.0f / ((float)n_vols_at_curr_priority);
-
-                // For the entry boundary, multiply by 0.5. That is, for the
-                // initial interpolated value, only a half step-size is
-                // considered in the computation. For the second-to-last
-                // interpolation point, also multiply by 0.5, since there will
-                // be a final step at the globalMaxAlpha boundary.
-                weight *= (0 == t || num_steps - 1 == t) ? 0.5f : 1.0f;
+                // If multiple volumes at the same priority, use the average.
+                //
+                // The 1/n lives HERE and nowhere else. It exists because n volumes at one
+                // priority are competing descriptions of the SAME matter at this point and
+                // must be averaged rather than summed. Anything describing DIFFERENT matter
+                // must not inherit it.
+                float weight = boundary / ((float)n_vols_at_curr_priority);
 
                 // Loop through volumes and add to the area_density.
                 for (int vol_id = 0; vol_id < NUM_VOLUMES; vol_id++) {
@@ -548,6 +691,32 @@ projectKernel(const cudaTextureObject_t * __restrict__ volume_texs, // array of 
                     }
                 }
             }
+
+#if NUM_DENSITY_FIELDS > 0
+            // Additive material-density fields (mosaic fork item 2). Inside `!inside_mesh`
+            // with the volumes: a subtractive mesh means "this matter is displaced", and a
+            // catheter body displaces blood *and* the iodine dissolved in it, so leaving the
+            // field inside it would render a floating column of contrast with no fluid.
+            for (int f = 0; f < NUM_DENSITY_FIELDS; f++) {
+                if (0 == field_do_trace[f]) {
+                    continue;
+                }
+                if (alpha < field_min_alpha[f] || alpha > field_max_alpha[f]) {
+                    continue;
+                }
+                float fx = field_sx[f] + alpha * field_rx[f];
+                float fy = field_sy[f] + alpha * field_ry[f];
+                float fz = field_sz[f] + alpha * field_rz[f];
+
+                // `boundary`, NOT `weight`: this field describes matter the volumes do not
+                // carry, so its magnitude must not depend on how many volumes happen to
+                // overlap here. And `+ 0.5f`, the same texel-centre correction the linear
+                // density fetch above applies -- after the IJK_SAMPLE_OFFSET fix there is
+                // exactly ONE sampling convention in this kernel.
+                area_density[field_material_index[f]] +=
+                    boundary * tex3D<float>(field_texs[f], fx + 0.5f, fy + 0.5f, fz + 0.5f);
+            }
+#endif
         }
         alpha += step;
     }
