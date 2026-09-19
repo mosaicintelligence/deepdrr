@@ -1,8 +1,14 @@
 # Mosaic's changes to DeepDRR
 
-This checkout is a fork of DeepDRR used by [`mosaic`](https://github.com/) `sim/fluoro_sim`.
+This checkout is a fork of DeepDRR used by `fluoro_sim` in
+[`mosaicintelligence/sim`](https://github.com/mosaicintelligence/sim). The consumer installs it from
+[`fluoro_sim/env_fluoro.yaml`](https://github.com/mosaicintelligence/sim/blob/hemal/fluoro_sim/fluoro_sim/env_fluoro.yaml)
+as `deepdrr[cuda12x] @ git+ssh://git@github.com/mosaicintelligence/deepdrr@hemal/fluoro-sim-contrast`.
 This file is the record of **every** local change: what it is, why, and the measurement that
 justifies it.
+
+`sim/` used to live inside the `mosaic` repository, so the sections below say "in mosaic" and write paths as
+`sim/fluoro_sim/...`. The same files are now at `fluoro_sim/...` (and `tests/...`) in `mosaicintelligence/sim`.
 
 **Audience:** the human developer maintaining this fork, and any AI agent editing it.
 
@@ -12,7 +18,7 @@ way: if a change cannot be described here on its own, it is probably two changes
 
 Mosaic's own docs stay in the mosaic repo. This file does not restate them; it cites them.
 The canonical design and measurement record for the contrast work is
-`sim/fluoro_sim/CONTRAST_INTEGRATION.md` in that repo.
+`fluoro_sim/docs/CONTRAST_INTEGRATION.md` in `mosaicintelligence/sim`.
 
 ## Rules for adding an item
 
